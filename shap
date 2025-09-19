@@ -1,0 +1,306 @@
+import numpy as np
+import torch
+import shap
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+
+class ShapleyExplainer:
+    """基于Shapley值的BMADDPG决策解释器"""
+    
+    def __init__(self, agents, n_samples=100):
+        self.agents = agents
+        self.n_samples = n_samples
+        self.scaler = StandardScaler()
+        
+    def compute_shapley_values(self, observations, beliefs, agent_id=0):
+        """计算指定智能体的Shapley值"""
+        
+        # 准备输入数据
+        X = self._prepare_input(observations, beliefs)
+        
+        # 定义预测函数
+        def predict_fn(inputs):
+            """将输入映射到动作输出"""
+            actions = []
+            for inp in inputs:
+                obs, belief = self._unpack_input(inp)
+                obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
+                belief_tensor = torch.FloatTensor(belief).unsqueeze(0)
+                
+                with torch.no_grad():
+                    action = self.agents[agent_id].actor(obs_tensor, belief_tensor)
+                    actions.append(action.numpy().flatten())
+            return np.array(actions)
+        
+        # 创建SHAP解释器
+        explainer = shap.KernelExplainer(predict_fn, X[:self.n_samples])
+        
+        # 计算SHAP值
+        shap_values = explainer.shap_values(X)
+        
+        return shap_values, X
+    
+    def _prepare_input(self, observations, beliefs):
+        """准备输入数据格式"""
+        n_samples = len(observations)
+        X = []
+        
+        for i in range(n_samples):
+            # 拼接观测和信念
+            combined = np.concatenate([observations[i], beliefs[i]])
+            X.append(combined)
+            
+        X = np.array(X)
+        return X
+    
+    def _unpack_input(self, combined_input):
+        """解包输入数据"""
+        obs_dim = self.agents[0].obs_dim
+        obs = combined_input[:obs_dim]
+        belief = combined_input[obs_dim:]
+        return obs, belief
+    
+    def compute_agent_contributions(self, joint_state, joint_action, reward):
+        """计算每个智能体对联合奖励的贡献"""
+        n_agents = len(self.agents)
+        contributions = np.zeros(n_agents)
+        
+        # 计算所有可能的联盟
+        from itertools import combinations
+        
+        def coalition_value(coalition_agents):
+            """计算联盟的价值"""
+            if len(coalition_agents) == 0:
+                return 0
+            
+            # 模拟只有联盟中智能体参与时的价值
+            coalition_actions = []
+            for i in range(n_agents):
+                if i in coalition_agents:
+                    coalition_actions.append(joint_action[i])
+                else:
+                    coalition_actions.append(np.zeros_like(joint_action[i]))
+            
+            # 这里需要您的环境来评估联盟价值
+            # 简化示例：价值与参与智能体数量成比例
+            value = reward * len(coalition_agents) / n_agents
+            return value
+        
+        # 计算Shapley值
+        for agent_id in range(n_agents):
+            shapley_value = 0
+            
+            for k in range(n_agents):
+                # 不包含当前智能体的所有k大小联盟
+                coalitions = list(combinations([i for i in range(n_agents) if i != agent_id], k))
+                
+                for coalition in coalitions:
+                    coalition_with = list(coalition) + [agent_id]
+                    coalition_without = list(coalition)
+                    
+                    # 边际贡献
+                    marginal = coalition_value(coalition_with) - coalition_value(coalition_without)
+                    
+                    # Shapley权重
+                    weight = 1 / (n_agents * np.math.comb(n_agents-1, k))
+                    shapley_value += weight * marginal
+            
+            contributions[agent_id] = shapley_value
+            
+        return contributions
+    
+    def visualize_shapley_values(self, shap_values, feature_names=None):
+        """可视化Shapley值"""
+        
+        # 准备特征名称
+        if feature_names is None:
+            obs_dim = self.agents[0].obs_dim
+            belief_dim = self.agents[0].belief_dim
+            feature_names = [f'Obs_{i}' for i in range(obs_dim)] + \
+                          [f'Belief_{i}' for i in range(belief_dim)]
+        
+        # 创建可视化
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # 1. 特征重要性条形图
+        ax = axes[0, 0]
+        feature_importance = np.abs(shap_values).mean(axis=0)
+        sorted_idx = np.argsort(feature_importance)[-10:]  # Top 10特征
+        ax.barh(range(len(sorted_idx)), feature_importance[sorted_idx])
+        ax.set_yticks(range(len(sorted_idx)))
+        ax.set_yticklabels([feature_names[i] for i in sorted_idx])
+        ax.set_xlabel('Mean |SHAP value|')
+        ax.set_title('Feature Importance')
+        
+        # 2. SHAP值分布
+        ax = axes[0, 1]
+        for i in sorted_idx[-5:]:  # Top 5特征
+            ax.scatter(shap_values[:, i], range(len(shap_values)), 
+                      label=feature_names[i], alpha=0.5, s=10)
+        ax.set_xlabel('SHAP value')
+        ax.set_ylabel('Sample')
+        ax.set_title('SHAP Value Distribution')
+        ax.legend()
+        
+        # 3. 智能体贡献饼图（示例数据）
+        ax = axes[1, 0]
+        agent_contributions = [0.3, 0.25, 0.25, 0.2]  # 示例
+        agent_labels = [f'Agent {i}' for i in range(4)]
+        ax.pie(agent_contributions, labels=agent_labels, autopct='%1.1f%%')
+        ax.set_title('Agent Contributions to Defense')
+        
+        # 4. 时间序列贡献
+        ax = axes[1, 1]
+        time_steps = 50
+        contributions_over_time = np.random.randn(4, time_steps).cumsum(axis=1)
+        for i in range(4):
+            ax.plot(contributions_over_time[i], label=f'Agent {i}')
+        ax.set_xlabel('Time Step')
+        ax.set_ylabel('Cumulative Contribution')
+        ax.set_title('Agent Contributions Over Time')
+        ax.legend()
+        
+        plt.tight_layout()
+        plt.savefig('shapley_analysis.png', dpi=150, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+    
+    def explain_mtd_decision(self, observation, belief, agent_id=0):
+        """解释单个MTD决策"""
+        
+        # 获取动作
+        obs_tensor = torch.FloatTensor(observation).unsqueeze(0)
+        belief_tensor = torch.FloatTensor(belief).unsqueeze(0)
+        
+        with torch.no_grad():
+            action = self.agents[agent_id].actor(obs_tensor, belief_tensor)
+            action = action.numpy().flatten()
+        
+        # 计算SHAP值
+        X = self._prepare_input([observation], [belief])
+        
+        def predict_fn(inputs):
+            actions = []
+            for inp in inputs:
+                obs, bel = self._unpack_input(inp)
+                obs_t = torch.FloatTensor(obs).unsqueeze(0)
+                bel_t = torch.FloatTensor(bel).unsqueeze(0)
+                with torch.no_grad():
+                    act = self.agents[agent_id].actor(obs_t, bel_t)
+                    actions.append(act.numpy().flatten())
+            return np.array(actions)
+        
+        # 使用少量背景样本
+        background = X[:10] + np.random.randn(10, X.shape[1]) * 0.1
+        explainer = shap.KernelExplainer(predict_fn, background)
+        shap_values = explainer.shap_values(X)
+        
+        # 生成解释报告
+        report = {
+            'action': action,
+            'action_components': {
+                'ip_hopping': action[0],
+                'port_reconfig': action[1] if len(action) > 1 else 0,
+                'resource_alloc': action[2] if len(action) > 2 else 0
+            },
+            'top_factors': self._get_top_factors(shap_values[0], observation, belief),
+            'belief_influence': np.abs(shap_values[0][-len(belief):]).mean(),
+            'observation_influence': np.abs(shap_values[0][:-len(belief)]).mean()
+        }
+        
+        return report
+    
+    def _get_top_factors(self, shap_vals, observation, belief, top_k=5):
+        """获取最重要的决策因素"""
+        abs_shap = np.abs(shap_vals)
+        top_indices = np.argsort(abs_shap)[-top_k:][::-1]
+        
+        factors = []
+        obs_dim = len(observation)
+        
+        for idx in top_indices:
+            if idx < obs_dim:
+                factor_name = f'Observation_{idx}'
+                factor_value = observation[idx]
+            else:
+                belief_idx = idx - obs_dim
+                factor_name = f'AttackerType_{belief_idx}_Belief'
+                factor_value = belief[belief_idx]
+            
+            factors.append({
+                'name': factor_name,
+                'value': factor_value,
+                'shap_value': shap_vals[idx],
+                'importance': abs_shap[idx]
+            })
+        
+        return factors
+
+# ==================== 使用示例 ====================
+def demonstrate_shap_analysis():
+    """演示SHAP分析"""
+    
+    # 创建智能体
+    n_agents = 4
+    obs_dim = 10
+    action_dim = 3
+    belief_dim = 4
+    
+    agents = [BMADDPGAgent(i, obs_dim, action_dim, belief_dim, n_agents) 
+              for i in range(n_agents)]
+    
+    # 创建解释器
+    explainer = ShapleyExplainer(agents)
+    
+    # 生成测试数据
+    n_samples = 50
+    observations = [np.random.randn(obs_dim) for _ in range(n_samples)]
+    beliefs = [np.random.dirichlet(np.ones(belief_dim)) for _ in range(n_samples)]
+    
+    # 计算SHAP值
+    print("Computing SHAP values...")
+    shap_values, X = explainer.compute_shapley_values(observations, beliefs, agent_id=0)
+    
+    # 可视化
+    print("Visualizing results...")
+    explainer.visualize_shapley_values(shap_values)
+    
+    # 解释单个决策
+    print("\nExplaining single MTD decision:")
+    test_obs = np.random.randn(obs_dim)
+    test_belief = np.array([0.1, 0.2, 0.6, 0.1])  # 高概率为APT攻击
+    
+    report = explainer.explain_mtd_decision(test_obs, test_belief, agent_id=0)
+    
+    print(f"MTD Action taken: {report['action']}")
+    print(f"  - IP Hopping: {report['action_components']['ip_hopping']:.3f}")
+    print(f"  - Port Reconfiguration: {report['action_components']['port_reconfig']:.3f}")
+    print(f"  - Resource Allocation: {report['action_components']['resource_alloc']:.3f}")
+    print(f"\nBelief Influence: {report['belief_influence']:.3f}")
+    print(f"Observation Influence: {report['observation_influence']:.3f}")
+    print("\nTop Decision Factors:")
+    for factor in report['top_factors']:
+        print(f"  - {factor['name']}: value={factor['value']:.3f}, "
+              f"SHAP={factor['shap_value']:.3f}, importance={factor['importance']:.3f}")
+    
+    # 计算智能体贡献
+    print("\nComputing agent contributions...")
+    joint_state = [np.random.randn(obs_dim) for _ in range(n_agents)]
+    joint_action = [np.random.randn(action_dim) for _ in range(n_agents)]
+    reward = 10.0
+    
+    contributions = explainer.compute_agent_contributions(joint_state, joint_action, reward)
+    print("Agent Contributions to Joint Reward:")
+    for i, contrib in enumerate(contributions):
+        print(f"  Agent {i}: {contrib:.3f} ({contrib/reward*100:.1f}%)")
+
+if __name__ == "__main__":
+    # 运行BMADDPG训练
+    print("Training BMADDPG...")
+    train_bmaddpg()
+    
+    # 运行SHAP分析
+    print("\n" + "="*50)
+    print("Running SHAP Analysis...")
+    demonstrate_shap_analysis()
