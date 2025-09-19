@@ -1,0 +1,311 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+from collections import deque
+import random
+
+# ==================== 网络架构 ====================
+class BeliefEncoder(nn.Module):
+    """信念编码器：处理攻击者类型的不确定性"""
+    def __init__(self, belief_dim, hidden_dim=64):
+        super(BeliefEncoder, self).__init__()
+        self.fc1 = nn.Linear(belief_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        
+    def forward(self, belief):
+        x = F.relu(self.fc1(belief))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+class Actor(nn.Module):
+    """Actor网络：输出MTD动作（分散执行）"""
+    def __init__(self, obs_dim, belief_dim, action_dim, hidden_dim=256):
+        super(Actor, self).__init__()
+        self.belief_encoder = BeliefEncoder(belief_dim)
+        
+        # 局部观测处理
+        self.obs_fc = nn.Linear(obs_dim, hidden_dim)
+        
+        # 融合层
+        self.fusion_fc = nn.Linear(hidden_dim + 64, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, action_dim)
+        
+    def forward(self, obs, belief):
+        # 编码信念状态
+        belief_encoding = self.belief_encoder(belief)
+        
+        # 处理局部观测
+        obs_encoding = F.relu(self.obs_fc(obs))
+        
+        # 融合信念和观测
+        x = torch.cat([obs_encoding, belief_encoding], dim=-1)
+        x = F.relu(self.fusion_fc(x))
+        x = F.relu(self.fc2(x))
+        
+        # 输出动作（MTD参数）
+        action = torch.tanh(self.fc3(x))
+        return action
+
+class Critic(nn.Module):
+    """Critic网络：评估联合动作价值（集中训练）"""
+    def __init__(self, total_obs_dim, total_action_dim, belief_dim, n_agents, hidden_dim=256):
+        super(Critic, self).__init__()
+        self.n_agents = n_agents
+        self.belief_encoder = BeliefEncoder(belief_dim)
+        
+        # 处理所有智能体的观测和动作
+        input_dim = total_obs_dim + total_action_dim + 64
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+        
+    def forward(self, all_obs, all_actions, belief):
+        # 编码共享信念
+        belief_encoding = self.belief_encoder(belief)
+        
+        # 拼接所有输入
+        x = torch.cat([all_obs, all_actions, belief_encoding], dim=-1)
+        
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        q_value = self.fc3(x)
+        return q_value
+
+# ==================== BMADDPG智能体 ====================
+class BMADDPGAgent:
+    def __init__(self, agent_id, obs_dim, action_dim, belief_dim, n_agents, lr_actor=1e-4, lr_critic=1e-3):
+        self.agent_id = agent_id
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.belief_dim = belief_dim
+        self.n_agents = n_agents
+        
+        # Actor网络（策略网络）
+        self.actor = Actor(obs_dim, belief_dim, action_dim)
+        self.actor_target = Actor(obs_dim, belief_dim, action_dim)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
+        
+        # Critic网络（价值网络）
+        total_obs_dim = obs_dim * n_agents
+        total_action_dim = action_dim * n_agents
+        self.critic = Critic(total_obs_dim, total_action_dim, belief_dim, n_agents)
+        self.critic_target = Critic(total_obs_dim, total_action_dim, belief_dim, n_agents)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
+        
+        # 初始化目标网络
+        self.update_target_networks(tau=1.0)
+        
+    def select_action(self, obs, belief, noise=0.1):
+        """选择MTD动作（如IP跳变、端口重配置、资源重分配）"""
+        obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
+        belief_tensor = torch.FloatTensor(belief).unsqueeze(0)
+        
+        action = self.actor(obs_tensor, belief_tensor).squeeze(0).detach().numpy()
+        
+        # 添加探索噪声
+        if noise > 0:
+            action += np.random.normal(0, noise, size=action.shape)
+            action = np.clip(action, -1, 1)
+            
+        return action
+    
+    def update_target_networks(self, tau=0.01):
+        """软更新目标网络"""
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
+# ==================== 信念更新模块 ====================
+class BeliefUpdater:
+    """贝叶斯信念更新：推断攻击者类型"""
+    def __init__(self, n_attacker_types):
+        self.n_types = n_attacker_types
+        self.belief = np.ones(n_attacker_types) / n_attacker_types  # 均匀先验
+        
+    def update(self, observation, action_taken):
+        """基于观测更新对攻击者类型的信念"""
+        # 计算似然 P(obs|type, action)
+        likelihoods = self._compute_likelihoods(observation, action_taken)
+        
+        # 贝叶斯更新
+        self.belief = self.belief * likelihoods
+        self.belief = self.belief / (self.belief.sum() + 1e-8)
+        
+        return self.belief
+    
+    def _compute_likelihoods(self, observation, action):
+        """计算不同攻击者类型下的观测似然"""
+        likelihoods = np.zeros(self.n_types)
+        
+        # 示例：基于观测到的攻击模式推断类型
+        attack_indicators = observation.get('attack_pattern', [])
+        
+        for i in range(self.n_types):
+            if i == 0:  # 扫描型攻击者
+                likelihoods[i] = 1.0 if 'scan' in attack_indicators else 0.3
+            elif i == 1:  # APT攻击者
+                likelihoods[i] = 1.0 if 'persistent' in attack_indicators else 0.3
+            elif i == 2:  # DDoS攻击者
+                likelihoods[i] = 1.0 if 'flood' in attack_indicators else 0.3
+            else:  # 内部威胁
+                likelihoods[i] = 1.0 if 'insider' in attack_indicators else 0.3
+                
+        return likelihoods + 0.1  # 避免零概率
+
+# ==================== 经验回放缓冲区 ====================
+class ReplayBuffer:
+    def __init__(self, capacity=100000):
+        self.buffer = deque(maxlen=capacity)
+        
+    def push(self, state, action, reward, next_state, done, belief):
+        """存储转换"""
+        self.buffer.append((state, action, reward, next_state, done, belief))
+        
+    def sample(self, batch_size):
+        """采样小批量"""
+        batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done, belief = zip(*batch)
+        return state, action, reward, next_state, done, belief
+    
+    def __len__(self):
+        return len(self.buffer)
+
+# ==================== BMADDPG训练器 ====================
+class BMADDPGTrainer:
+    def __init__(self, n_agents, obs_dim, action_dim, belief_dim, n_attacker_types):
+        self.n_agents = n_agents
+        self.agents = [BMADDPGAgent(i, obs_dim, action_dim, belief_dim, n_agents) 
+                       for i in range(n_agents)]
+        self.belief_updater = BeliefUpdater(n_attacker_types)
+        self.replay_buffer = ReplayBuffer()
+        self.gamma = 0.99
+        
+    def train_step(self, batch_size=64):
+        """执行一步训练"""
+        if len(self.replay_buffer) < batch_size:
+            return
+        
+        # 采样批量数据
+        states, actions, rewards, next_states, dones, beliefs = self.replay_buffer.sample(batch_size)
+        
+        # 转换为张量
+        states = [torch.FloatTensor(s) for s in zip(*states)]
+        actions = [torch.FloatTensor(a) for a in zip(*actions)]
+        rewards = [torch.FloatTensor(r).unsqueeze(1) for r in zip(*rewards)]
+        next_states = [torch.FloatTensor(s) for s in zip(*next_states)]
+        dones = [torch.FloatTensor(d).unsqueeze(1) for d in zip(*dones)]
+        beliefs = torch.FloatTensor(beliefs)
+        
+        # 更新每个智能体
+        for i, agent in enumerate(self.agents):
+            # 获取所有智能体的观测和动作
+            all_obs = torch.cat(states, dim=1)
+            all_actions = torch.cat(actions, dim=1)
+            all_next_obs = torch.cat(next_states, dim=1)
+            
+            # 计算目标动作
+            next_actions = []
+            for j, other_agent in enumerate(self.agents):
+                if j == i:
+                    next_action = agent.actor_target(next_states[j], beliefs)
+                else:
+                    next_action = other_agent.actor_target(next_states[j], beliefs)
+                next_actions.append(next_action)
+            all_next_actions = torch.cat(next_actions, dim=1)
+            
+            # 更新Critic
+            q_value = agent.critic(all_obs, all_actions, beliefs)
+            next_q_value = agent.critic_target(all_next_obs, all_next_actions, beliefs)
+            target_q = rewards[i] + self.gamma * next_q_value * (1 - dones[i])
+            
+            critic_loss = F.mse_loss(q_value, target_q.detach())
+            agent.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            agent.critic_optimizer.step()
+            
+            # 更新Actor
+            new_action = agent.actor(states[i], beliefs)
+            new_all_actions = actions.copy()
+            new_all_actions[i] = new_action
+            new_all_actions = torch.cat(new_all_actions, dim=1)
+            
+            actor_loss = -agent.critic(all_obs, new_all_actions, beliefs).mean()
+            agent.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            agent.actor_optimizer.step()
+            
+            # 软更新目标网络
+            agent.update_target_networks()
+    
+    def act(self, observations, explore=True):
+        """所有智能体选择动作"""
+        current_belief = self.belief_updater.belief
+        actions = []
+        
+        for i, agent in enumerate(self.agents):
+            noise = 0.1 if explore else 0.0
+            action = agent.select_action(observations[i], current_belief, noise)
+            actions.append(action)
+            
+        return actions
+
+# ==================== 主训练循环示例 ====================
+def train_bmaddpg():
+    # 环境参数
+    n_agents = 4  # EI设备数量
+    obs_dim = 10  # 观测维度
+    action_dim = 3  # MTD动作维度（IP跳变、端口重配置、资源分配）
+    belief_dim = 4  # 攻击者类型数量
+    n_attacker_types = 4
+    
+    # 创建训练器
+    trainer = BMADDPGTrainer(n_agents, obs_dim, action_dim, belief_dim, n_attacker_types)
+    
+    # 训练循环
+    n_episodes = 1000
+    for episode in range(n_episodes):
+        # 重置环境（这里需要您的SIoT环境）
+        observations = [np.random.randn(obs_dim) for _ in range(n_agents)]
+        episode_reward = 0
+        
+        for step in range(100):  # 每个episode的步数
+            # 选择动作
+            actions = trainer.act(observations, explore=True)
+            
+            # 环境步进（需要实现您的SIoT环境）
+            next_observations = [np.random.randn(obs_dim) for _ in range(n_agents)]
+            rewards = [np.random.randn() for _ in range(n_agents)]  # 防御效用
+            done = False
+            
+            # 更新信念
+            attack_observation = {'attack_pattern': ['scan']}  # 示例
+            trainer.belief_updater.update(attack_observation, actions[0])
+            
+            # 存储经验
+            trainer.replay_buffer.push(
+                observations, actions, rewards, next_observations, 
+                [done]*n_agents, trainer.belief_updater.belief
+            )
+            
+            # 训练
+            if len(trainer.replay_buffer) > 64:
+                trainer.train_step()
+            
+            observations = next_observations
+            episode_reward += sum(rewards)
+            
+            if done:
+                break
+        
+        if episode % 10 == 0:
+            print(f"Episode {episode}, Reward: {episode_reward:.2f}")
+            print(f"Current Belief: {trainer.belief_updater.belief}")
+
+if __name__ == "__main__":
+    train_bmaddpg()
